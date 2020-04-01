@@ -157,6 +157,8 @@ static void enqueue_r3(sd_t *sd) {
 	sd->send_len = 5;
 }
 
+// TODO: verify that these crcs are actually correct! The Arduino library does
+// *not* check them!
 static void enqueue_crc16(sd_t *sd) {
 	sd->send[0] = sd->crc16 >> 8;
 	sd->send[1] = sd->crc16 & 0xFF;

@@ -1,16 +1,12 @@
-examples := ${wildcard examples/*.c}
-examples := ${examples:.c=}
-examples := examples/CardInfo
-
-all: ${examples}
+all: examples/simple
 
 src/sd.o: src/sd.c
 	${CC} ${CFLAGS} -c -o $@ -Wall -g $<
 
 examples/%: examples/%.c src/sd.h src/sd.o
-	${CC} ${CFLAGS} -o$@.out -Isrc -Wall -lsimavr -lelf -g src/sd.o $<
+	${CC} ${CFLAGS} -o$@ -Isrc -Wall -lsimavr -lelf -g src/sd.o $<
 
 clean:
-	rm src/sd.o examples/CardInfo.out
+	rm -f src/sd.o examples/simple
 
 .PHONY: all clean
