@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <string.h>
 
 #include <simavr/sim_avr.h>
 #include <simavr/sim_elf.h>
@@ -14,13 +16,17 @@ int main() {
 	elf_read_firmware("CardInfo.elf", &firmware);
 	if (!(avr = avr_make_mcu_by_name("atmega328p"))) {
 		fprintf(stderr, "Error creating avr object\n");
-		exit(1);
+		return 1;
 	}
 	avr_init(avr);
 	avr_load_firmware(avr, &firmware);
 
 	sd_t sd;
-	sd_init(&sd, avr, "CardInfo.img");
+	if (sd_init(&sd, avr, "CardInfo.img") != 0) {
+		fprintf(stderr, "Error initializing SD card: %s\n",
+			strerror(errno));
+		return 1;
+	}
 	avr_connect_irq(
 		avr_io_getirq(avr, AVR_IOCTL_SPI_GETIRQ(0), SPI_IRQ_OUTPUT),
 		sd.irq + SD_IRQ_MOSI);
