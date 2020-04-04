@@ -29,10 +29,8 @@ enum {
 				// definition of idle state. Here, it means the
 				// SD card is waiting for a normal command.
 	SD_STATE_IDLE_ACMD,	// Last command was CMD55, waiting for next one.
-	SD_STATE_READ_RESPONSE,	// Normal read response being sent
-	SD_STATE_READ_STBT,	// Sending STBT before block
+	SD_STATE_CMD_RESPONSE,	// In the middle of sending a normal response.
 	SD_STATE_READ_BLOCK,	// In the middle of sending a data block.
-	SD_STATE_READ_CRC,	// Sending the CRC after a block.
 	SD_STATE_WRITE_RESPONSE, // Sending initial response after write cmd
 	SD_STATE_WRITE_STBT,	// Waiting for the "start block token" that
 				// precedes each block.
@@ -56,6 +54,8 @@ typedef struct sd_t {
 	avr_irq_t *irq;
 
 	int state;
+	int after_send_state;	// which state to change to after sending the
+				// current command response.
 	bool cs;		// True when CS is low; this is logical.
 
 	unsigned char cmd[COMMAND_LENGTH]; // Command read in progress

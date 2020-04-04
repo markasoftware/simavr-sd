@@ -20,6 +20,7 @@ void sigint_handler(int sig) {
 	exit(0);
 }
 
+// TODO: look into why GCC complains about this curly brace. It still works.
 const struct sigaction sigint_action = {
 	.sa_handler = &sigint_handler,
 	.sa_mask = 0,

@@ -16,7 +16,7 @@
 
 #ifdef SD_DEBUG
 #include <stdio.h>
-#define DEBUG(msg, ...) fprintf(stderr, "SD_DEBUG: " msg "\n", ##__VA_ARGS__);
+#define DEBUG(msg, ...) fprintf(stderr, "SD_DEBUG: " msg "\n", ##__VA_ARGS__)
 #else
 #define DEBUG(msg, ...)
 #endif
@@ -131,6 +131,7 @@ static void error_reset(sd_t *sd) {
 static void enqueue_r1_inner(sd_t *sd, unsigned char byte) {
 	sd->send[0] = byte;
 	sd->send_len = 1;
+	sd->state = SD_STATE_CMD_RESPONSE;
 }
 
 #define enqueue_r1(sd) enqueue_r1_inner(sd, 0x00)
@@ -144,6 +145,7 @@ static void enqueue_r2(sd_t *sd) {
 	sd->send[0] = 0b00000000;
 	sd->send[1] = 0b00000000;
 	sd->send_len = 2;
+	sd->state = SD_STATE_CMD_RESPONSE;
 }
 
 static void enqueue_r3(sd_t *sd) {
@@ -155,6 +157,7 @@ static void enqueue_r3(sd_t *sd) {
 	sd->send[3] = 0b00000000;
 	sd->send[4] = 0b00000000;
 	sd->send_len = 5;
+	sd->state = SD_STATE_CMD_RESPONSE;
 }
 
 // TODO: verify that these crcs are actually correct! The Arduino library does
@@ -163,6 +166,7 @@ static void enqueue_crc16(sd_t *sd) {
 	sd->send[0] = sd->crc16 >> 8;
 	sd->send[1] = sd->crc16 & 0xFF;
 	sd->send_len = 2;
+	sd->state = SD_STATE_CMD_RESPONSE;
 }
 
 // Called after a complete command was received. Analyzes the command and places
@@ -171,6 +175,8 @@ static void enqueue_crc16(sd_t *sd) {
 static void enqueue_response(sd_t *sd) {
 	// TODO: verify CRC, basic format of received message.
 	/* if (sd->cmd[0] & (1 << 7) || sd->cmd[0] ^ (1 << 6)) */
+
+	sd->after_send_state = sd->state;
 
 	sd->send_idx = 0;
 	unsigned char command_index = sd->cmd[0] & 0b00111111;
@@ -191,18 +197,18 @@ static void enqueue_response(sd_t *sd) {
 	// this is probably incorrect -- many commands other than CMD55 and
 	// ACMD41 are likely supposed to work before ACMD41.
 	if (sd->state == SD_STATE_SPI) {
-		DEBUG("CMD55 from SPI mode")
 		if (command_index == 55) {
-			sd->state = SD_STATE_SPI_ACMD;
+			DEBUG("CMD55 from SPI mode");
+			sd->after_send_state = SD_STATE_SPI_ACMD;
 			return enqueue_idle_r1(sd);
 		}
 		return enqueue_illegal_command(sd);
 	}
 
 	if (sd->state == SD_STATE_SPI_ACMD) {
-		DEBUG("ACMD41 from SPI mode");
 		if (command_index == 41) {
-			sd->state = SD_STATE_IDLE;
+			DEBUG("ACMD41 from SPI mode");
+			sd->after_send_state = SD_STATE_IDLE;
 			return enqueue_r1(sd);
 		}
 		return enqueue_illegal_command(sd);
@@ -213,7 +219,7 @@ static void enqueue_response(sd_t *sd) {
 		switch (command_index) {
 		case 0:
 			sd_reset(sd);
-			sd->state = SD_STATE_SPI;
+			sd->after_send_state = SD_STATE_SPI;
 			enqueue_idle_r1(sd);
 			break;
 		case 13:
@@ -228,11 +234,15 @@ static void enqueue_response(sd_t *sd) {
 				enqueue_address_error(sd);
 				break;
 			}
-			sd->state = SD_STATE_READ_RESPONSE;
 			sd->head = sd->mass + command_arg;
 			sd->bytes_xfrd = 0;
 			sd->crc16 = 0xFFFF;
 			sd->multiple_block = command_index == 18;
+			sd->after_send_state = SD_STATE_READ_BLOCK;
+			sd->send[0] = 0x00;
+			sd->send[1] = 0xFE;
+			sd->send_len = 2;
+			sd->state = SD_STATE_CMD_RESPONSE;
 			break;
 		case 24:
 		case 25:
@@ -250,16 +260,14 @@ static void enqueue_response(sd_t *sd) {
 			break;
 
 		case 55:
-			// TODO Are ACMD commands ever valid in non-idle states?
-			if (sd->state == SD_STATE_IDLE) {
-				sd->state = SD_STATE_IDLE_ACMD;
-			}
 			enqueue_r1(sd);
+			sd->after_send_state = SD_STATE_IDLE_ACMD;
 			break;
 		case 58:
 			enqueue_r3(sd);
 			break;
 		default:
+			DEBUG("Unknown/illegal command");
 			enqueue_illegal_command(sd);
 		}
 	} else {
@@ -273,7 +281,72 @@ static void enqueue_response(sd_t *sd) {
 
 }
 
-#define SPI_SEND_BYTE(byte) avr_raise_irq(sd->irq + SD_IRQ_MISO, (byte));
+// return the next byte to be sent over SPI
+static unsigned char send_byte(sd_t *sd) {
+	switch (sd->state) { 
+	case SD_STATE_READ_BLOCK:
+		DEBUG("Sending byte %d", sd->bytes_xfrd);
+		crc16_byte(&sd->crc16, *(unsigned char*)(sd->head));
+		if (++(sd->bytes_xfrd) == BLOCK_SIZE) {
+			DEBUG("Block fully read and transmitted");
+			enqueue_crc16(sd);
+		}
+		return *(unsigned char *)(sd->head++);
+	case SD_STATE_WRITE_DRES:
+		// TODO: multi-block write
+		sd->state = SD_STATE_IDLE;
+		return 0b00000101;
+	case SD_STATE_CMD_RESPONSE:;
+		unsigned char result = sd->send[sd->send_idx++];
+		if (sd->send_idx == sd->send_len) {
+			sd->state = sd->after_send_state;
+			sd->after_send_state = SD_STATE_IDLE;
+			sd->send_idx = 0;
+		}
+		return result;
+	}
+
+	return 0xFF;
+}
+
+// update the sd object based on a byte received over SPI
+static void accept_byte(sd_t *sd, unsigned char byte) {
+	switch (sd->state) {
+	case SD_STATE_WRITE_STBT:
+		if (byte == 0xFE) {
+			DEBUG("Received write start block token.");
+			sd->state = SD_STATE_WRITE_LISTEN;
+		}
+		break;
+	case SD_STATE_WRITE_LISTEN:
+		*(unsigned char *)(sd->head++) = byte;
+		if (++(sd->bytes_xfrd) == BLOCK_SIZE) {
+			sd->state = SD_STATE_WRITE_DRES;
+		}
+		break;
+	// modes where we should, theoretically, never receive a
+	// command. Treat any byte as an error.
+	// TODO: remove the next few once we have multi-block read support
+	case SD_STATE_WRITE_DRES:
+	case SD_STATE_CMD_RESPONSE:
+		if (byte ^ 0xFF) {
+			DEBUG("Received a command while sending");
+			error_reset(sd);
+		}
+		break;
+	// In all other modes, it's valid to receive a normal command.
+	default:
+		if (byte ^ 0xFF || sd->cmd_idx) {
+			sd->cmd[sd->cmd_idx] = byte;
+			sd->cmd_idx++;
+
+			if (sd->cmd_idx == COMMAND_LENGTH) {
+				sd->cmd_idx = 0;
+				enqueue_response(sd);
+			}
+		}
+	}
+}
 
 static void spi_hook(avr_irq_t *irq, uint32_t value, void *param) {
 	sd_t *sd = (sd_t *)param;
@@ -281,107 +354,8 @@ static void spi_hook(avr_irq_t *irq, uint32_t value, void *param) {
 	// ignore unless chip selected
 	if (!sd->cs) return;
 
-	// in *almost* all states, we should listen to commands. Even while
-	// transmitting a read block, for example, there is an interruption
-	// command. We should only not listen when they are actively sending
-	// something other than a command, i.e, writing. Handle all those
-	// special states here, then default to the main code at the end of the
-	// function.
-	bool recv_cmd = true;
-	bool send_cmd = true;
-
-	switch (sd->state) { 
-	case SD_STATE_READ_RESPONSE:
-		// R1, but just avoiding the main send_cmd chain of command
-		SPI_SEND_BYTE(0x00);
-		sd->state = SD_STATE_READ_STBT;
-		send_cmd = false;
-		break;
-	case SD_STATE_READ_STBT:
-		// All blocks start with this, as a sort of marker.
-		SPI_SEND_BYTE(0xFE);
-		send_cmd = false;
-		sd->state = SD_STATE_READ_BLOCK;
-		break;
-	case SD_STATE_READ_BLOCK:
-//		DEBUG("Sending byte %d", sd->bytes_xfrd);
-		SPI_SEND_BYTE(*(unsigned char *)(sd->head));
-		crc16_byte(&sd->crc16, *(unsigned char*)(sd->head));
-		(sd->head)++;
-		if (++(sd->bytes_xfrd) == BLOCK_SIZE) {
-			DEBUG("Block fully read and transmitted");
-			enqueue_crc16(sd);
-			sd->state = SD_STATE_READ_CRC;
-		}
-		send_cmd = false;
-		break;
-	case SD_STATE_READ_CRC:
-		// we let the normal send_cmd do most of the logic here. We just
-		// need to update the state when it's done. TODO: make sure this
-		// logic will never break if we receive an ill-timed command.
-		if (sd->send_idx == sd->send_len) {
-			sd->state = SD_STATE_IDLE;
-		}
-		break;
-	case SD_STATE_WRITE_STBT:
-		// we received our byte! Lord oh lordy yes!
-		if (value == 0b11111110) {
-			DEBUG("Received Start Block Token");
-			sd->state = SD_STATE_WRITE_LISTEN;
-		}
-		break;
-	case SD_STATE_WRITE_LISTEN:
-		*(unsigned char *)(sd->head++) = (unsigned char) value;
-		if (++(sd->bytes_xfrd) == BLOCK_SIZE) {
-			sd->state = SD_STATE_WRITE_DRES;
-		}
-		SPI_SEND_BYTE(0xFF);
-		// the main state where commands are ignored
-		recv_cmd = false;
-		send_cmd = false;
-		break;
-	case SD_STATE_WRITE_DRES:
-		SPI_SEND_BYTE(0b00000101);
-		// TODO: multi-block write
-		sd->state = SD_STATE_IDLE;
-		send_cmd = false;
-		// they shouldn't be sending us a command before we ack
-		recv_cmd = false;
-		break;
-	}
-
-	// ignore empty bytes in-between commands
-	if (recv_cmd && (value ^ 0xFF || sd->cmd_idx)) {
-		// If we were in the middle of something, reset the bloody card!
-		// Those maggots!
-		if (send_cmd && sd->send_idx < sd->send_len) {
-			return error_reset(sd);
-		}
-		sd->cmd[sd->cmd_idx] = value;
-		sd->cmd_idx++;
-
-		if (sd->cmd_idx == COMMAND_LENGTH) {
-			// Since all commands are longer than all responses, 
-			sd->cmd_idx = 0;
-			enqueue_response(sd);
-			// this 1-byte delay *is* necessary. You can't be sending the
-			// response to a command *while* it's being sent!
-			if (send_cmd) {
-				SPI_SEND_BYTE(0xFF);
-				send_cmd = false;
-			}
-		}
-	}
-	
-	// finally, send a byte if we have one.
-	if (send_cmd) {
-		if (sd->send_idx < sd->send_len) {
-			DEBUG("Send byte: %d", sd->send[sd->send_idx]);
-			SPI_SEND_BYTE(sd->send[sd->send_idx++]);
-		} else {
-			SPI_SEND_BYTE(0xFF);
-		}
-	}
+	avr_raise_irq(sd->irq + SD_IRQ_MISO, send_byte(sd));
+	accept_byte(sd, value & 0xFF);
 }
 
 static void cs_hook(avr_irq_t *irq, uint32_t value, void *param) {
