@@ -31,11 +31,10 @@ enum {
 	SD_STATE_IDLE_ACMD,	// Last command was CMD55, waiting for next one.
 	SD_STATE_CMD_RESPONSE,	// In the middle of sending a normal response.
 	SD_STATE_READ_BLOCK,	// In the middle of sending a data block.
-	SD_STATE_WRITE_RESPONSE, // Sending initial response after write cmd
 	SD_STATE_WRITE_STBT,	// Waiting for the "start block token" that
 				// precedes each block.
 	SD_STATE_WRITE_LISTEN,	// Receiving a block
-	SD_STATE_WRITE_DRES,	// Sending data response
+	SD_STATE_WRITE_CRC,	// Receive CRC after a block
 };
 
 #define SD_IDLE_P(st) \
@@ -57,6 +56,7 @@ typedef struct sd_t {
 	int after_send_state;	// which state to change to after sending the
 				// current command response.
 	bool cs;		// True when CS is low; this is logical.
+	bool enforce_crc;
 
 	unsigned char cmd[COMMAND_LENGTH]; // Command read in progress
 	unsigned char cmd_idx;	// Which byte of command we will read next
@@ -68,6 +68,8 @@ typedef struct sd_t {
 	void *mass;		// SD card block data, from mmap
 	size_t capacity;
 	unsigned short crc16;	// In-progress crc
+	bool crc16_fst;		// If true, we are receiving the first byte of
+				// the write CRC.
 	void *head;		// read/write "head", points to somewhere in
 				// mass
 	int bytes_xfrd;		// Bytes of the block already transferred.

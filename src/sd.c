@@ -113,6 +113,7 @@ void sd_reset(sd_t *sd) {
 	DEBUG("Reset!");
 	// do NOT reset sd->cs -- that's controlled by interrupts
 
+	sd->enforce_crc = false;
 	// also, do not need to reset read/write related variables -- they will
 	// be reset when entering a read- or write-related mode.
 	sd->cmd_idx = 0;
@@ -138,6 +139,7 @@ static void enqueue_r1_inner(sd_t *sd, unsigned char byte) {
 #define enqueue_idle_r1(sd) enqueue_r1_inner(sd, 0x01)
 #define enqueue_illegal_command_r1(sd) enqueue_r1_inner(sd, 0x00)
 #define enqueue_data_response(sd) enqueue_r1_inner(sd, 0x05)
+#define enqueue_crc_error_data_response(sd) enqueue_r1_inner(sd, 0x0b);
 #define enqueue_illegal_command(sd) enqueue_r1_inner(sd, 0x04)
 #define enqueue_address_error(sd) enqueue_r1_inner(sd, 0x20)
 
@@ -246,17 +248,18 @@ static void enqueue_response(sd_t *sd) {
 			break;
 		case 24:
 		case 25:
-			DEBUG("Write block beginning at byte %d\n", command_arg);
+			DEBUG("Write block beginning at byte %d", command_arg);
 			if (command_arg > sd->capacity - BLOCK_SIZE) {
 				DEBUG("Illegal start byte!\n");
 				enqueue_address_error(sd);
 				break;
 			}
-			sd->state = SD_STATE_WRITE_RESPONSE;
+			sd->after_send_state = SD_STATE_WRITE_STBT;
 			sd->head = sd->mass + command_arg;
 			sd->bytes_xfrd = 0;
 			sd->crc16 = 0xFFFF;
 			sd->multiple_block = command_index == 25;
+			enqueue_r1(sd);
 			break;
 
 		case 55:
@@ -285,17 +288,15 @@ static void enqueue_response(sd_t *sd) {
 static unsigned char send_byte(sd_t *sd) {
 	switch (sd->state) { 
 	case SD_STATE_READ_BLOCK:
-		DEBUG("Sending byte %d", sd->bytes_xfrd);
+//		DEBUG("Sending byte %d", sd->bytes_xfrd);
 		crc16_byte(&sd->crc16, *(unsigned char*)(sd->head));
 		if (++(sd->bytes_xfrd) == BLOCK_SIZE) {
 			DEBUG("Block fully read and transmitted");
 			enqueue_crc16(sd);
 		}
 		return *(unsigned char *)(sd->head++);
-	case SD_STATE_WRITE_DRES:
-		// TODO: multi-block write
-		sd->state = SD_STATE_IDLE;
-		return 0b00000101;
+	case SD_STATE_WRITE_CRC:
+		return 0x05;
 	case SD_STATE_CMD_RESPONSE:;
 		unsigned char result = sd->send[sd->send_idx++];
 		if (sd->send_idx == sd->send_len) {
@@ -317,17 +318,40 @@ static void accept_byte(sd_t *sd, unsigned char byte) {
 			DEBUG("Received write start block token.");
 			sd->state = SD_STATE_WRITE_LISTEN;
 		}
+		// TODO: (this is a larger todo) We should be listening for a
+		// reset command even now, right?
 		break;
 	case SD_STATE_WRITE_LISTEN:
 		*(unsigned char *)(sd->head++) = byte;
+		crc16_byte(&sd->crc16, byte);
 		if (++(sd->bytes_xfrd) == BLOCK_SIZE) {
-			sd->state = SD_STATE_WRITE_DRES;
+			DEBUG("Entire block received -- Receiving CRC");
+			sd->crc16_fst = true;
+			sd->state = SD_STATE_WRITE_CRC;
 		}
+		break;
+	case SD_STATE_WRITE_CRC:;
+		unsigned char expected = sd->crc16_fst ?
+			sd->crc16 & 0xFF
+			: sd->crc16 >> 8;
+		DEBUG("CRC Byte: Expected %d, got %d.", expected, byte);
+		sd->after_send_state = SD_STATE_IDLE;
+		if (expected == byte || !sd->enforce_crc) {
+			if (!sd->crc16_fst) {
+				enqueue_data_response(sd);
+			}
+		} else {
+			// this is wrong -- it might send the response after
+			// reading only the first byte of the CRC -- but the
+			// Arduino library doesn't enforce CRCs anyway!
+			enqueue_crc_error_data_response(sd);
+		}
+		sd->crc16_fst = false;
 		break;
 	// modes where we should, theoretically, never receive a
 	// command. Treat any byte as an error.
-	// TODO: remove the next few once we have multi-block read support
-	case SD_STATE_WRITE_DRES:
+	// TODO: remove the next few once we have multi-block read support. And
+	// verify that it's actually illegal for a command to be sent here.
 	case SD_STATE_CMD_RESPONSE:
 		if (byte ^ 0xFF) {
 			DEBUG("Received a command while sending");
